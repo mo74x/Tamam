@@ -1,0 +1,72 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs & TypeScript caches
+dist/
+build/
+out/
+.next/
+.turbo/
+.cache/
+*.tsbuildinfo
+.eslintcache
+.oxlintcache
+
+# Generated files (Prisma client, etc.)
+generated/
+**/generated/prisma/
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Tests & coverage
+coverage/
+.nyc_output/
+
+# Logs & runtime
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+pids/
+*.pid
+*.seed
+*.pid.lock
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# Temp directories
+.temp/
+.tmp/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDEs & editors
+.idea/
+*.iml
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+tamam-logo-dark.svg
+tamam-logo-light.svg
+TAMAM.md
+# Installed agent skill caches (lockfile & AGENTS.md stay tracked)
+**/.agents/skills/
+**/.claude/skills/
+**/.windsurf/skills/

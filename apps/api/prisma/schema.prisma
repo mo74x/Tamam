@@ -1,0 +1,226 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum PlanTier {
+  STARTER
+  GROWTH
+  PRO
+}
+
+enum MemberRole {
+  OWNER
+  MODERATOR
+}
+
+enum ChannelType {
+  WHATSAPP_COEXISTENCE
+  WHATSAPP_DEDICATED
+  WHATSAPP_FORWARD
+}
+
+enum ProofStatus {
+  PROCESSING
+  WAITING
+  CONFIRMED
+  SUSPICIOUS
+  UNMATCHED
+  REJECTED
+}
+
+enum EvidenceSource {
+  ANDROID_NOTIF
+  SMS_FORWARD
+  MANUAL_PASTE
+  EMAIL
+}
+
+enum PaymentMethod {
+  INSTAPAY
+  VODAFONE_CASH
+  ETISALAT_CASH
+  ORANGE_CASH
+  WE_PAY
+  BANK_TRANSFER
+  UNKNOWN
+}
+
+enum DecisionActor {
+  SYSTEM
+  OWNER
+  MODERATOR
+}
+
+model Seller {
+  id                  String    @id @default(cuid())
+  businessName        String
+  ownerPhone          String    @unique // E.164 e.g. +2010...
+  plan                PlanTier  @default(STARTER)
+  evidenceSecretHash  String    // SHA-256 of per-seller bearer token
+  matchWindowBeforeMs Int       @default(900000)  // 15 min
+  matchWindowAfterMs  Int       @default(1800000) // 30 min
+  waitingDebounceMs   Int       @default(20000)   // 20s before sending WAITING reply
+  retentionDays       Int       @default(14)      // Auto-purge raw SMS & images
+  replyTemplates      Json?     // Editable Egyptian Arabic overrides
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  members             TeamMember[]
+  channels            Channel[]
+  devices             Device[]
+  customers           Customer[]
+  proofs              Proof[]
+  evidence            Evidence[]
+  auditLogs           AuditLog[]
+}
+
+model TeamMember {
+  id        String     @id @default(cuid())
+  sellerId  String
+  seller    Seller     @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  name      String
+  phone     String
+  role      MemberRole @default(MODERATOR)
+  isActive  Boolean    @default(true)
+  createdAt DateTime   @default(now())
+
+  @@unique([sellerId, phone])
+}
+
+model Channel {
+  id              String      @id @default(cuid())
+  sellerId        String
+  seller          Seller      @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  type            ChannelType
+  phoneNumberId   String      @unique // Meta WhatsApp phone_number_id
+  wabaId          String?
+  encryptedToken  String
+  isActive        Boolean     @default(true)
+  createdAt       DateTime    @default(now())
+}
+
+model Device {
+  id              String    @id @default(cuid())
+  sellerId        String
+  seller          Seller    @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  deviceLabel     String    // e.g. "Samsung A55 - Owner"
+  appVersion      String
+  lastHeartbeatAt DateTime  @default(now())
+  offlineAlerted  Boolean   @default(false)
+  createdAt       DateTime  @default(now())
+
+  @@index([sellerId, lastHeartbeatAt])
+}
+
+model Customer {
+  id          String   @id @default(cuid())
+  sellerId    String
+  seller      Seller   @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  phone       String   // E.164
+  displayName String?
+  trustScore  Int      @default(100) // Drops on confirmed fraud rejections
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  proofs      Proof[]
+
+  @@unique([sellerId, phone])
+}
+
+model Proof {
+  id                      String        @id @default(cuid())
+  sellerId                String
+  seller                  Seller        @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  customerId              String
+  customer                Customer      @relation(fields: [customerId], references: [id])
+
+  channelMessageId        String        @unique // WhatsApp wamid idempotency
+  imageKey                String?       // Nullable after retention purge
+  imageSha256             String
+  imagePhash              BigInt        // Signed 64-bit dHash for PostgreSQL bit_count(a # b)
+
+  extractedAmountPiasters BigInt?       // Never use floats
+  extractedRef            String?       // Normalized ASCII alphanumeric
+  extractedTime           DateTime?     // Parsed from Africa/Cairo -> UTC
+  extractedSender         String?       // Normalized Arabic/Latin
+  extractedMethod         PaymentMethod @default(UNKNOWN)
+  extractionConfidence    Float?
+  extractionRaw           Json?         // Full structured vision response
+
+  status                  ProofStatus   @default(PROCESSING)
+  statusReason            String?
+  waitingReplySent        Boolean       @default(false)
+  expiresAt               DateTime?
+  createdAt               DateTime      @default(now())
+  updatedAt               DateTime      @updatedAt
+
+  claimedEvidence         Evidence?
+  match                   Match?
+
+  @@index([sellerId, status, createdAt])
+  @@index([sellerId, extractedRef])
+  @@index([sellerId, imageSha256])
+  @@index([sellerId, createdAt]) // Used for 90-day pHash scan window
+}
+
+model Evidence {
+  id                   String         @id @default(cuid())
+  sellerId             String
+  seller               Seller         @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  source               EvidenceSource
+  senderApp            String?        // Package name or SMS sender ID (e.g. "CIB", "com.egyptianbanks.instapay")
+  dedupeHash           String         @unique // SHA-256(sellerId + rawText + minuteBucket)
+  rawText              String?        // Nullable after retention purge
+
+  parsedAmountPiasters BigInt
+  parsedRef            String?
+  parsedTime           DateTime       // UTC
+  parsedSender         String?        // Normalized
+  parserName           String         // e.g. "instapay_notif_v1" or "llm_fallback"
+  parseConfidence      Float          @default(1.0)
+
+  // Atomic 1-to-1 claim: Postgres allows multiple NULLs, enforces uniqueness once claimed
+  claimedByProofId     String?        @unique
+  claimedByProof       Proof?         @relation(fields: [claimedByProofId], references: [id])
+
+  receivedAt           DateTime       @default(now())
+  match                Match?
+
+  @@index([sellerId, parsedAmountPiasters, receivedAt])
+  @@index([sellerId, parsedRef])
+}
+
+model Match {
+  id         String        @id @default(cuid())
+  proofId    String        @unique
+  proof      Proof         @relation(fields: [proofId], references: [id], onDelete: Cascade)
+  evidenceId String        @unique
+  evidence   Evidence      @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+  score      Int
+  reasons    Json          // e.g. ["EXACT_REF", "EXACT_AMOUNT", "TIME_DELTA_18S"]
+  decidedBy  DecisionActor @default(SYSTEM)
+  actorId    String?       // TeamMember.id on manual override
+  note       String?
+  createdAt  DateTime      @default(now())
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  sellerId   String
+  seller     Seller   @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  entityType String   // "PROOF" | "EVIDENCE" | "MATCH" | "DEVICE"
+  entityId   String
+  action     String   // e.g. "PROOF_AUTO_CONFIRMED", "MANUAL_OVERRIDE_REJECT"
+  actorType  String   // "SYSTEM" | "OWNER" | "MODERATOR"
+  actorId    String?
+  payload    Json
+  createdAt  DateTime @default(now())
+
+  @@index([sellerId, entityType, entityId])
+  @@index([sellerId, createdAt])
+}
