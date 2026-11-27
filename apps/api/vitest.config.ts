@@ -8,5 +8,15 @@ export default defineConfig({
     globals: true,
     root: './',
     include: ['**/*.spec.ts'],
+    coverage: {
+      provider: 'v8',
+      include: ['src/**/*.ts'],
+      exclude: ['src/generated/**', 'src/**/*.spec.ts'],
+      thresholds: {
+        'src/matching/**/*.ts': { branches: 85 },
+        'src/evidence/parsers/**/*.ts': { branches: 85 },
+        'src/common/**/*.ts': { branches: 85 },
+      },
+    },
   },
 });

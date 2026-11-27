@@ -70,3 +70,5 @@ TAMAM.md
 **/.agents/skills/
 **/.claude/skills/
 **/.windsurf/skills/
+.claude
+.windsurf

@@ -1,6 +1,6 @@
 generator client {
   provider = "prisma-client"
-  output   = "../generated/prisma"
+  output   = "../src/generated/prisma"
 }
 
 datasource db {
@@ -31,6 +31,7 @@ enum ProofStatus {
   SUSPICIOUS
   UNMATCHED
   REJECTED
+  SUPERSEDED
 }
 
 enum EvidenceSource {
@@ -77,6 +78,7 @@ model Seller {
   proofs              Proof[]
   evidence            Evidence[]
   auditLogs           AuditLog[]
+  usageRecords        UsageRecord[]
 }
 
 model TeamMember {
@@ -97,11 +99,13 @@ model Channel {
   sellerId        String
   seller          Seller      @relation(fields: [sellerId], references: [id], onDelete: Cascade)
   type            ChannelType
-  phoneNumberId   String      @unique // Meta WhatsApp phone_number_id
+  phoneNumberId   String?     @unique // Nullable for WHATSAPP_FORWARD; required for DEDICATED/COEXISTENCE
   wabaId          String?
-  encryptedToken  String
+  encryptedToken  String?
   isActive        Boolean     @default(true)
   createdAt       DateTime    @default(now())
+
+  proofs          Proof[]
 }
 
 model Device {
@@ -110,10 +114,12 @@ model Device {
   seller          Seller    @relation(fields: [sellerId], references: [id], onDelete: Cascade)
   deviceLabel     String    // e.g. "Samsung A55 - Owner"
   appVersion      String
+  tokenHash       String?   @unique
   lastHeartbeatAt DateTime  @default(now())
   offlineAlerted  Boolean   @default(false)
   createdAt       DateTime  @default(now())
 
+  @@unique([sellerId, deviceLabel])
   @@index([sellerId, lastHeartbeatAt])
 }
 
@@ -136,13 +142,18 @@ model Proof {
   id                      String        @id @default(cuid())
   sellerId                String
   seller                  Seller        @relation(fields: [sellerId], references: [id], onDelete: Cascade)
-  customerId              String
-  customer                Customer      @relation(fields: [customerId], references: [id])
+  customerId              String?
+  customer                Customer?     @relation(fields: [customerId], references: [id])
+  channelId               String?
+  channel                 Channel?      @relation(fields: [channelId], references: [id], onDelete: SetNull)
 
   channelMessageId        String        @unique // WhatsApp wamid idempotency
   imageKey                String?       // Nullable after retention purge
   imageSha256             String
-  imagePhash              BigInt        // Signed 64-bit dHash for PostgreSQL bit_count(a # b)
+  imagePhash              BigInt?       // Signed 64-bit dHash for PostgreSQL bit_count(a # b)
+  isForwarded             Boolean       @default(false)
+  replyToPhone            String?
+  visionCostMicroUsd      Int?
 
   extractedAmountPiasters BigInt?       // Never use floats
   extractedRef            String?       // Normalized ASCII alphanumeric
@@ -175,11 +186,12 @@ model Evidence {
   source               EvidenceSource
   senderApp            String?        // Package name or SMS sender ID (e.g. "CIB", "com.egyptianbanks.instapay")
   dedupeHash           String         @unique // SHA-256(sellerId + rawText + minuteBucket)
+  semanticKey          String?        @unique // sellerId:ref:amountPiasters
   rawText              String?        // Nullable after retention purge
 
-  parsedAmountPiasters BigInt
+  parsedAmountPiasters BigInt?
   parsedRef            String?
-  parsedTime           DateTime       // UTC
+  parsedTime           DateTime?      // UTC
   parsedSender         String?        // Normalized
   parserName           String         // e.g. "instapay_notif_v1" or "llm_fallback"
   parseConfidence      Float          @default(1.0)
@@ -193,6 +205,24 @@ model Evidence {
 
   @@index([sellerId, parsedAmountPiasters, receivedAt])
   @@index([sellerId, parsedRef])
+}
+
+model UsageRecord {
+  id                 String   @id @default(cuid())
+  sellerId           String
+  seller             Seller   @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  monthKey           String
+  proofCount         Int      @default(0)
+  visionCalls        Int      @default(0)
+  llmFallbackCalls   Int      @default(0)
+  visionCostMicroUsd Int      @default(0)
+  templateAlertsSent Int      @default(0)
+  quotaWarningSent   Boolean  @default(false)
+  quotaAlertSent     Boolean  @default(false)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@unique([sellerId, monthKey])
 }
 
 model Match {
