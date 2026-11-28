@@ -1,0 +1,284 @@
+[
+  {
+    "id": "ipn-1",
+    "senderApp": "com.egyptianbanks.instapay",
+    "rawText": "InstaPay: You received EGP 650.00 from sara.ali@instapay 01012345678 Ref: IPN2611998801",
+    "receivedAt": "2026-11-26T10:00:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "65000",
+      "ref": "IPN2611998801",
+      "sender": "sara.ali@instapay 01012345678"
+    }
+  },
+  {
+    "id": "ipn-2",
+    "senderApp": "InstaPay",
+    "rawText": "تم استلام مبلغ 1,250.50 جنيه من ahmed.nabil@instapay رقم مرجعي IPN2611998802",
+    "receivedAt": "2026-11-26T10:05:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "125050",
+      "ref": "IPN2611998802",
+      "sender": "ahmed.nabil@instapay"
+    }
+  },
+  {
+    "id": "ipn-3",
+    "senderApp": "IPN",
+    "rawText": "وصلتك حوالة بمبلغ 450 جنيه من mona.hassan@instapay RRN: IPN2611998803",
+    "receivedAt": "2026-11-26T10:10:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "45000",
+      "ref": "IPN2611998803",
+      "sender": "mona.hassan@instapay"
+    }
+  },
+  {
+    "id": "ipn-4",
+    "senderApp": "com.egyptianbanks.instapay",
+    "rawText": "You received EGP 3,200.00 from Youssef Adel Ref: IPN2611998804",
+    "receivedAt": "2026-11-26T10:15:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "320000",
+      "ref": "IPN2611998804",
+      "sender": "youssef adel"
+    }
+  },
+  {
+    "id": "ipn-5",
+    "senderApp": "instapay",
+    "rawText": "تم إضافة مبلغ 890.75 ج.م من kareem.zaki@instapay رقم العملية IPN2611998805",
+    "receivedAt": "2026-11-26T10:20:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "89075",
+      "ref": "IPN2611998805",
+      "sender": "kareem.zaki@instapay"
+    }
+  },
+  {
+    "id": "ipn-6",
+    "senderApp": "IPN",
+    "rawText": "You have received LE 180.00 from nada@instapay 01234567890 Ref: IPN2611998806",
+    "receivedAt": "2026-11-26T10:25:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "18000",
+      "ref": "IPN2611998806",
+      "sender": "nada@instapay 01234567890"
+    }
+  },
+  {
+    "id": "vf-1",
+    "senderApp": "VF-Cash",
+    "rawText": "تم استلام مبلغ ١٬٢٥٠٫٥٠ جنيه من رقم ٠١٠١٢٣٤٥٦٧٨ المسجل باسم محمد احمد على رقم محفظتك 01099999999 رقم العملية VFC1002001",
+    "receivedAt": "2026-11-26T10:30:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "125050",
+      "ref": "VFC1002001",
+      "sender": "محمد احمد 01012345678"
+    }
+  },
+  {
+    "id": "vf-2",
+    "senderApp": "Vodafone",
+    "rawText": "You have received EGP 750.00 from 01022334455 Ref: VFC1002002",
+    "receivedAt": "2026-11-26T10:35:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "75000",
+      "ref": "VFC1002002",
+      "sender": "01022334455"
+    }
+  },
+  {
+    "id": "vf-3",
+    "senderApp": "com.emeint.android.myservices",
+    "rawText": "تم استلام مبلغ 320 جنيه من رقم 01055667788 المسجل باسم سارة محمود رقم العملية VFC1002003",
+    "receivedAt": "2026-11-26T10:40:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "32000",
+      "ref": "VFC1002003",
+      "sender": "ساره محمود 01055667788"
+    }
+  },
+  {
+    "id": "vf-4",
+    "senderApp": "VF-Cash",
+    "rawText": "received LE 950.25 from 01088776655 Ref: VFC1002004",
+    "receivedAt": "2026-11-26T10:45:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "95025",
+      "ref": "VFC1002004",
+      "sender": "01088776655"
+    }
+  },
+  {
+    "id": "vf-5",
+    "senderApp": "Vodafone",
+    "rawText": "تم استلام مبلغ 500.00 ج.م من 01044332211 رقم العملية VFC1002005",
+    "receivedAt": "2026-11-26T10:50:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "50000",
+      "ref": "VFC1002005",
+      "sender": "01044332211"
+    }
+  },
+  {
+    "id": "vf-6",
+    "senderApp": "VF-Cash",
+    "rawText": "تم استلام مبلغ 2,100 جنيه من رقم 01033445566 المسجل باسم طارق علي رقم العملية VFC1002006",
+    "receivedAt": "2026-11-26T10:55:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "210000",
+      "ref": "VFC1002006",
+      "sender": "طارق علي 01033445566"
+    }
+  },
+  {
+    "id": "cib-1",
+    "senderApp": "CIB",
+    "rawText": "CIB: Your account ****1234 has been credited with EGP 2,400.00 from Nada Ali Ref: FT26330121",
+    "receivedAt": "2026-11-26T11:00:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "240000",
+      "ref": "FT26330121",
+      "sender": "nada ali"
+    }
+  },
+  {
+    "id": "cib-2",
+    "senderApp": "cibeg",
+    "rawText": "CIB: Your account has been credited with EGP 875.50 from Omar Fathy Ref: CIB998811",
+    "receivedAt": "2026-11-26T11:05:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "87550",
+      "ref": "CIB998811",
+      "sender": "omar fathy"
+    }
+  },
+  {
+    "id": "cib-3",
+    "senderApp": "com.cib.mobile",
+    "rawText": "تم إضافة مبلغ 1,600.00 جنيه من خالد سمير Ref: FT26330123",
+    "receivedAt": "2026-11-26T11:10:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "160000",
+      "ref": "FT26330123",
+      "sender": "خالد سمير"
+    }
+  },
+  {
+    "id": "cib-4",
+    "senderApp": "CIB",
+    "rawText": "CIB: credited with EGP 540.00 from Hany Adel Ref: FT26330124",
+    "receivedAt": "2026-11-26T11:15:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "54000",
+      "ref": "FT26330124",
+      "sender": "hany adel"
+    }
+  },
+  {
+    "id": "cib-5",
+    "senderApp": "CIB",
+    "rawText": "تم اضافه مبلغ 3,100.00 ج.م من مريم عادل Ref: FT26330125",
+    "receivedAt": "2026-11-26T11:20:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "310000",
+      "ref": "FT26330125",
+      "sender": "مريم عادل"
+    }
+  },
+  {
+    "id": "nbe-1",
+    "senderApp": "NBE",
+    "rawText": "البنك الأهلي المصري: تم إضافة مبلغ 1,500.25 جنيه من كريم حسن رقم مرجعي NBE77889901",
+    "receivedAt": "2026-11-26T11:25:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "150025",
+      "ref": "NBE77889901",
+      "sender": "كريم حسن"
+    }
+  },
+  {
+    "id": "nbe-2",
+    "senderApp": "AlAhly",
+    "rawText": "NBE: Account credited with EGP 920.00 from Sherif Kamel Ref: NBE77889902",
+    "receivedAt": "2026-11-26T11:30:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "92000",
+      "ref": "NBE77889902",
+      "sender": "sherif kamel"
+    }
+  },
+  {
+    "id": "nbe-3",
+    "senderApp": "com.nbe.mobile",
+    "rawText": "تم إيداع مبلغ 4,000 جنيه من حسام نبيل رقم العملية NBE77889903",
+    "receivedAt": "2026-11-26T11:35:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "400000",
+      "ref": "NBE77889903",
+      "sender": "حسام نبيل"
+    }
+  },
+  {
+    "id": "nbe-4",
+    "senderApp": "NBE",
+    "rawText": "تم اضافة مبلغ 680.50 ج.م من دينا طارق رقم مرجعي NBE77889904",
+    "receivedAt": "2026-11-26T11:40:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "68050",
+      "ref": "NBE77889904",
+      "sender": "دينا طارق"
+    }
+  },
+  {
+    "id": "nbe-5",
+    "senderApp": "AlAhly",
+    "rawText": "credited with EGP 275.00 from Rana Samir Ref: NBE77889905",
+    "receivedAt": "2026-11-26T11:45:00.000Z",
+    "expected": {
+      "isCredit": true,
+      "amountPiasters": "27500",
+      "ref": "NBE77889905",
+      "sender": "rana samir"
+    }
+  },
+  {
+    "id": "neg-otp",
+    "senderApp": "CIB",
+    "rawText": "CIB OTP: Your one-time verification code for EGP 500 transaction is 884411",
+    "receivedAt": "2026-11-26T11:50:00.000Z",
+    "expected": {
+      "isCredit": false
+    }
+  },
+  {
+    "id": "neg-debit",
+    "senderApp": "VF-Cash",
+    "rawText": "تم تحويل مبلغ 400 جنيه إلى رقم 01011223344",
+    "receivedAt": "2026-11-26T11:55:00.000Z",
+    "expected": {
+      "isCredit": false
+    }
+  }
+]

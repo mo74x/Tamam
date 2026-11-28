@@ -46,7 +46,7 @@ export class VodafoneCashParser implements EvidenceParser {
   parse(text: string, _receivedAt: Date): ParsedEvidence | null {
     // Arabic: "تم استلام مبلغ 750.00 جنيه من رقم 01012345678 المسجل باسم Ahmed ..."
     const arMatch = text.match(
-      /تم\s*استلام\s*مبلغ\s*([\d,.٬٫]+)\s*(?:جنيه|ج\.م|EGP)\s*من\s*(?:رقم\s*)?(01\d{9}|[\d•*]+)(?:\s*المسجل\s*باسم\s*([^\n.]+?)(?:\s*على\s*رقم|\s*رصيدك|$))?/i,
+      /تم\s*استلام\s*مبلغ\s*([\d,.٬٫]+)\s*(?:جنيه|ج\.م|EGP)\s*من\s*(?:رقم\s*)?(01\d{9}|[\d•*]+)(?:\s*المسجل\s*باسم\s*([^\n.]+?)(?:\s+على\s*رقم|\s+رصيدك|\s+رقم(?=\s)|\s+ref\b|$))?/i,
     );
     // English: "You have received EGP 750.00 from 01012345678 ..."
     const enMatch = text.match(
@@ -131,7 +131,7 @@ export class CibParser implements EvidenceParser {
   parse(text: string, _receivedAt: Date): ParsedEvidence | null {
     // Only credit alerts (avoid card spend/debit SMS)
     const match = text.match(
-      /(?:credited\s+with|تم\s*(?:إضافة|اضافة)\s*مبلغ)\s*(?:EGP)?\s*([\d,.٬٫]+)\s*(?:EGP|جنيه|ج\.م)?/i,
+      /(?:credited\s+with|تم\s*(?:إضاف[ةه]|اضاف[ةه])\s*مبلغ)\s*(?:EGP)?\s*([\d,.٬٫]+)\s*(?:EGP|جنيه|ج\.م)?/i,
     );
     if (!match) return null;
 
@@ -162,7 +162,7 @@ export class NbeParser implements EvidenceParser {
 
   parse(text: string, _receivedAt: Date): ParsedEvidence | null {
     const match = text.match(
-      /(?:تم\s*(?:إضافة|اضافة|إيداع|ايداع)\s*مبلغ|credited\s+with)\s*(?:EGP)?\s*([\d,.٬٫]+)\s*(?:EGP|جنيه|ج\.م)?/i,
+      /(?:تم\s*(?:إضاف[ةه]|اضاف[ةه]|إيداع|ايداع)\s*مبلغ|credited\s+with)\s*(?:EGP)?\s*([\d,.٬٫]+)\s*(?:EGP|جنيه|ج\.م)?/i,
     );
     if (!match) return null;
 
