@@ -1,7 +1,18 @@
 import { createHash } from 'crypto';
 import sharp from 'sharp';
 
-const EDITING_SOFTWARE_RE = /(photoshop|canva|picsart|gimp|snapseed|lightroom|figma|illustrator|pixlr)/i;
+const EDITING_SOFTWARE_RE =
+  /(photoshop|canva|picsart|gimp|snapseed|lightroom|figma|illustrator|pixlr)/i;
+
+export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+export const MAX_IMAGE_PIXELS = 25_000_000;
+export const MIN_RECEIPT_DIMENSION = 120;
+
+export class TinyStickerError extends Error {
+  constructor(width?: number, height?: number) {
+    super(`Skipping tiny non-receipt image (${width ?? '?'}x${height ?? '?'})`);
+  }
+}
 
 export interface PreparedImage {
   sha256: string;
@@ -17,14 +28,26 @@ export interface PreparedImage {
 }
 
 export async function prepareReceiptImage(rawBuffer: Buffer): Promise<PreparedImage> {
+  if (rawBuffer.length > MAX_IMAGE_BYTES) {
+    throw new Error('Image exceeds 10 MB safety limit');
+  }
+
   const sha256 = createHash('sha256').update(rawBuffer).digest('hex');
 
-  const meta = await sharp(rawBuffer).metadata();
+  const meta = await sharp(rawBuffer, { limitInputPixels: MAX_IMAGE_PIXELS }).metadata();
+  if (
+    meta.width !== undefined &&
+    meta.height !== undefined &&
+    Math.min(meta.width, meta.height) < MIN_RECEIPT_DIMENSION
+  ) {
+    throw new TinyStickerError(meta.width, meta.height);
+  }
+
   const exifText = meta.exif ? meta.exif.toString('latin1') : '';
   const softwareMatch = exifText.match(EDITING_SOFTWARE_RE);
 
   // 1) Resized JPEG for cheap vision inference + compact S3/R2 archival
-  const resizedJpeg = await sharp(rawBuffer)
+  const resizedJpeg = await sharp(rawBuffer, { limitInputPixels: MAX_IMAGE_PIXELS })
     .rotate() // Respect EXIF orientation before stripping metadata
     .resize({ width: 1024, height: 1024, fit: 'inside', withoutEnlargement: true })
     .jpeg({ quality: 82, mozjpeg: true })

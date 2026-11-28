@@ -6,6 +6,7 @@ export interface VisionProviderOutput {
   provider: string;
   model: string;
   latencyMs: number;
+  estimatedCostMicroUsd: number;
   data: VisionExtractionResult;
 }
 

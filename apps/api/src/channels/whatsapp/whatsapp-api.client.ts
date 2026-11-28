@@ -19,8 +19,77 @@ export interface QuickReplyButtonParam {
   payload: string;
 }
 
+const EXACT_ALLOWED_MEDIA_HOSTS = new Set([
+  'graph.facebook.com',
+  'lookaside.fbsbx.com',
+]);
+
+const ALLOWED_MEDIA_HOST_SUFFIXES = [
+  '.fbsbx.com',
+  '.fbcdn.net',
+  '.whatsapp.net',
+];
+
+function validateAllowedMediaUrl(rawUrl: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new WhatsAppApiError('Invalid media URL', 400, undefined, false);
+  }
+
+  if (parsed.protocol !== 'https:') {
+    throw new WhatsAppApiError('Untrusted media URL protocol', 400, undefined, false);
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  const allowed =
+    EXACT_ALLOWED_MEDIA_HOSTS.has(host) ||
+    ALLOWED_MEDIA_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix));
+
+  if (!allowed) {
+    throw new WhatsAppApiError(`Untrusted media host: ${host}`, 400, undefined, false);
+  }
+
+  return parsed;
+}
+
 @Injectable()
 export class WhatsAppApiClient {
+  async verifyPhoneNumber(
+    phoneNumberId: string,
+    accessToken: string,
+  ): Promise<{ verifiedName?: string; displayPhoneNumber?: string }> {
+    const res = await fetch(
+      `${GRAPH_BASE}/${encodeURIComponent(phoneNumberId)}?fields=verified_name,display_phone_number`,
+      {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        redirect: 'error',
+        signal: AbortSignal.timeout(10_000),
+      },
+    );
+
+    const body = (await res.json().catch(() => ({}))) as {
+      verified_name?: string;
+      display_phone_number?: string;
+      error?: { message?: string; code?: number };
+    };
+
+    if (!res.ok) {
+      throw new WhatsAppApiError(
+        body.error?.message ?? `WhatsApp phone verification failed (${res.status})`,
+        res.status,
+        body.error?.code,
+        res.status >= 500 || res.status === 429,
+      );
+    }
+
+    return {
+      verifiedName: body.verified_name,
+      displayPhoneNumber: body.display_phone_number,
+    };
+  }
+
   async sendTextMessage(params: {
     phoneNumberId: string;
     accessToken: string;
@@ -91,10 +160,18 @@ export class WhatsAppApiClient {
     mediaId: string;
     directUrl?: string;
   }): Promise<{ buffer: Buffer; mimeType: string }> {
-    const headers = { Authorization: `Bearer ${params.accessToken}` };
+    const fetchBinary = async (rawUrl: string) => {
+      const url = validateAllowedMediaUrl(rawUrl);
+      const headers: Record<string, string> = {};
+      if (url.hostname.toLowerCase() === 'graph.facebook.com') {
+        headers.Authorization = `Bearer ${params.accessToken}`;
+      }
 
-    const fetchBinary = async (url: string) => {
-      const res = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
+      const res = await fetch(url.toString(), {
+        headers,
+        redirect: 'error',
+        signal: AbortSignal.timeout(15_000),
+      });
       if (!res.ok) return { ok: false as const, status: res.status };
 
       const contentLength = Number(res.headers.get('content-length') ?? '0');
@@ -121,7 +198,8 @@ export class WhatsAppApiClient {
     }
 
     const metaRes = await fetch(`${GRAPH_BASE}/${encodeURIComponent(params.mediaId)}`, {
-      headers,
+      headers: { Authorization: `Bearer ${params.accessToken}` },
+      redirect: 'error',
       signal: AbortSignal.timeout(10_000),
     });
 
@@ -167,6 +245,7 @@ export class WhatsAppApiClient {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(payload),
+      redirect: 'error',
       signal: AbortSignal.timeout(10_000),
     });
 
@@ -177,7 +256,6 @@ export class WhatsAppApiClient {
 
     if (!res.ok) {
       const code = body.error?.code;
-      // 130429 = throughput rate limit; 5xx = transient Meta outage; 131047 = outside 24h window
       const retryable = res.status >= 500 || res.status === 429 || code === 130429;
       throw new WhatsAppApiError(
         body.error?.message ?? `WhatsApp API error ${res.status}`,

@@ -1,15 +1,16 @@
 import { InjectQueue, Processor, WorkerHost } from '@nestjs/bullmq';
 import { Logger } from '@nestjs/common';
+import { DelayedError, Job, Queue, UnrecoverableError } from 'bullmq';
 import { DecisionActor, Prisma, ProofStatus } from '../generated/prisma/client.js';
-import { DelayedError, Job, Queue } from 'bullmq';
-import { RedisLockService } from '../common/redis-lock.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { DuplicateDetectorService } from './duplicate-detector.service.js';
+import { ManualOverrideService } from './manual-override.service.js';
 import { EvidenceCandidate, scoreAndDecide } from './scoring.js';
 
 type MatchingJobData =
   | { sellerId: string; proofId: string }
-  | { sellerId: string; evidenceId: string };
+  | { sellerId: string; evidenceId: string }
+  | { proofId: string; verb: 'CONFIRM' | 'REJECT'; senderPhone: string };
 
 interface LockedEvidenceRow {
   id: string;
@@ -21,7 +22,7 @@ interface LockedEvidenceRow {
   receivedAt: Date;
 }
 
-const FEE_TOLERANCE_PIASTERS = 1500n; // 15.00 EGP window to catch wallet fee deductions as Tier 3
+const FEE_TOLERANCE_PIASTERS = 1500n;
 
 @Processor('matching', { concurrency: 10 })
 export class MatchingProcessor extends WorkerHost {
@@ -29,8 +30,8 @@ export class MatchingProcessor extends WorkerHost {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly redisLock: RedisLockService,
     private readonly duplicates: DuplicateDetectorService,
+    private readonly manualOverride: ManualOverrideService,
     @InjectQueue('matching') private readonly matchingQueue: Queue,
     @InjectQueue('replies') private readonly repliesQueue: Queue,
   ) {
@@ -38,128 +39,306 @@ export class MatchingProcessor extends WorkerHost {
   }
 
   async process(job: Job<MatchingJobData>, token?: string): Promise<void> {
-    const lockKey = `lock:match:${job.data.sellerId}`;
-    const lockToken = await this.redisLock.acquire(lockKey, 15_000);
-
-    if (!lockToken) {
-      // Another job is currently matching for this seller; delay briefly with jitter
-      const jitterMs = 200 + Math.floor(Math.random() * 250);
-      await job.moveToDelayed(Date.now() + jitterMs, token);
-      throw new DelayedError();
+    if (job.name === 'owner-action') {
+      await this.handleOwnerAction(
+        job.data as { proofId: string; verb: 'CONFIRM' | 'REJECT'; senderPhone: string },
+      );
+      return;
     }
 
-    try {
-      switch (job.name) {
-        case 'match-proof':
-          await this.matchProof((job.data as { sellerId: string; proofId: string }).proofId);
-          break;
-        case 'match-evidence':
-          await this.matchWaitingProofsForEvidence(
-            job.data.sellerId,
-            (job.data as { evidenceId: string }).evidenceId,
-          );
-          break;
-        case 'expire-waiting-proof':
-          await this.expireWaitingProof(
-            (job.data as { sellerId: string; proofId: string }).proofId,
-          );
-          break;
+    if (job.name === 'expire-waiting-proof') {
+      await this.expireWaitingProof((job.data as { sellerId: string; proofId: string }).proofId);
+      return;
+    }
+
+    if (job.name === 'match-evidence') {
+      const data = job.data as { sellerId: string; evidenceId: string };
+      await this.matchWaitingProofsForEvidence(data.sellerId, data.evidenceId, job, token);
+      return;
+    }
+
+    if (job.name === 'match-proof') {
+      const data = job.data as { sellerId: string; proofId: string };
+      const res = await this.matchProof(data.sellerId, data.proofId);
+      if (res === 'LOCK_CONTENDED') {
+        const jitterMs = 200 + Math.floor(Math.random() * 250);
+        await job.moveToDelayed(Date.now() + jitterMs, token);
+        throw new DelayedError();
       }
-    } finally {
-      await this.redisLock.release(lockKey, lockToken);
     }
   }
 
-  private async matchProof(proofId: string): Promise<void> {
+  private async handleOwnerAction(data: {
+    proofId: string;
+    verb: 'CONFIRM' | 'REJECT';
+    senderPhone: string;
+  }): Promise<void> {
     const proof = await this.prisma.proof.findUnique({
-      where: { id: proofId },
+      where: { id: data.proofId },
       include: {
         seller: {
           select: {
             id: true,
             ownerPhone: true,
-            matchWindowBeforeMs: true,
-            matchWindowAfterMs: true,
-            waitingDebounceMs: true,
+            members: {
+              where: { phone: data.senderPhone, isActive: true },
+              select: { id: true, role: true },
+            },
           },
         },
-        customer: { select: { id: true, phone: true } },
       },
     });
+    if (!proof) return;
 
-    if (
-      !proof ||
-      !proof.extractedAmountPiasters ||
-      !['PROCESSING', 'WAITING'].includes(proof.status)
-    ) {
+    const isOwner = proof.seller.ownerPhone === data.senderPhone;
+    const member = proof.seller.members[0];
+    if (!isOwner && !member) {
+      this.logger.warn(
+        `Unauthorized WhatsApp owner-action from ${data.senderPhone} on proof=${data.proofId}`,
+      );
       return;
     }
 
-    // 1. Run duplicate check only on fresh PROCESSING proofs
-    if (proof.status === 'PROCESSING') {
-      const dup = await this.duplicates.check({
-        id: proof.id,
-        sellerId: proof.sellerId,
-        customerId: proof.customerId,
-        extractedRef: proof.extractedRef,
-        imageSha256: proof.imageSha256,
-        imagePhash: proof.imagePhash,
-      });
+    const actorRole = isOwner ? DecisionActor.OWNER : (member.role as DecisionActor);
+    const actorId = member?.id ?? proof.seller.id;
 
-      if (dup.kind === 'SELF_RETRY_ALREADY_CONFIRMED') {
-        await this.prisma.$transaction([
-          this.prisma.proof.update({
-            where: { id: proof.id },
-            data: { status: ProofStatus.CONFIRMED, statusReason: 'IDEMPOTENT_SELF_RETRY' },
-          }),
-          this.prisma.auditLog.create({
-            data: {
-              sellerId: proof.sellerId,
-              entityType: 'PROOF',
-              entityId: proof.id,
-              action: 'PROOF_SELF_RETRY_CONFIRMED',
-              actorType: 'SYSTEM',
-              payload: { originalProofId: dup.originalProofId },
-            },
-          }),
-        ]);
-        const recipientPhone = proof.replyToPhone ?? proof.customer?.phone;
-        if (recipientPhone) {
-          await this.repliesQueue.add('customer-confirmed', {
-            sellerId: proof.sellerId,
-            customerPhone: recipientPhone,
-            proofId: proof.id,
-          });
-        }
-        return;
-      }
-
-      if (dup.kind === 'FRAUD_DUPLICATE') {
-        await this.markSuspicious(proof, dup.reason, {
-          matchedProofId: dup.matchedProofId,
-          hammingDistance: dup.hammingDistance ?? null,
+    try {
+      if (data.verb.toUpperCase() === 'CONFIRM') {
+        await this.manualOverride.confirmProof({
+          sellerId: proof.sellerId,
+          proofId: proof.id,
+          actorRole,
+          actorId,
+          autoLinkSingleCandidate: true,
+          note: 'Confirmed via WhatsApp alert button',
         });
-        return;
+        await this.repliesQueue.add('owner-action-feedback', {
+          sellerId: proof.sellerId,
+          recipientPhone: data.senderPhone,
+          proofId: proof.id,
+          message: 'تم تأكيد الإيصال ✅',
+        });
+      } else {
+        await this.manualOverride.rejectProof({
+          sellerId: proof.sellerId,
+          proofId: proof.id,
+          actorRole,
+          actorId,
+          isFraud: proof.status === ProofStatus.SUSPICIOUS,
+          note: 'Rejected via WhatsApp alert button',
+        });
+        await this.repliesQueue.add('owner-action-feedback', {
+          sellerId: proof.sellerId,
+          recipientPhone: data.senderPhone,
+          proofId: proof.id,
+          message: 'تم رفض الإيصال ❌',
+        });
       }
+    } catch (err) {
+      const msg = (err as Error).message || 'تعذر تنفيذ الإجراء';
+      await this.repliesQueue.add('owner-action-feedback', {
+        sellerId: proof.sellerId,
+        recipientPhone: data.senderPhone,
+        proofId: proof.id,
+        message: msg,
+      });
+      throw new UnrecoverableError(msg);
     }
+  }
 
-    const rawMeta = (proof.extractionRaw ?? {}) as {
-      fields?: { visualAnomalies?: string[] };
-      forensics?: { editingSoftwareFlag?: string | null };
-    };
+  private async matchProof(
+    sellerId: string,
+    proofId: string,
+    opts?: { unmatchedLagBypass?: boolean },
+  ): Promise<'LOCK_CONTENDED' | 'CONFIRMED' | 'DONE'> {
+    type TxOutcome =
+      | { outcome: 'LOCK_CONTENDED' }
+      | { outcome: 'NOOP' }
+      | {
+          outcome: 'SELF_RETRY';
+          originalProofId: string;
+          alreadyConfirmed: boolean;
+          sellerId: string;
+          proofId: string;
+          recipientPhone: string | null;
+        }
+      | {
+          outcome: 'CONFIRMED';
+          sellerId: string;
+          proofId: string;
+          recipientPhone: string | null;
+        }
+      | {
+          outcome: 'SUSPICIOUS';
+          sellerId: string;
+          proofId: string;
+          ownerPhone: string;
+          recipientPhone: string | null;
+          reasonCode: string;
+        }
+      | {
+          outcome: 'WAITING';
+          sellerId: string;
+          proofId: string;
+          recipientPhone: string | null;
+          waitingDebounceMs: number;
+          expiresAt: Date;
+          wasProcessing: boolean;
+        };
 
-    const anchorTime = proof.extractedTime ?? proof.createdAt;
-    const windowStart = new Date(anchorTime.getTime() - proof.seller.matchWindowBeforeMs);
-    const windowEnd = new Date(anchorTime.getTime() + proof.seller.matchWindowAfterMs);
-    const minAmount =
-      proof.extractedAmountPiasters > FEE_TOLERANCE_PIASTERS
-        ? proof.extractedAmountPiasters - FEE_TOLERANCE_PIASTERS
-        : 1n;
-    const maxAmount = proof.extractedAmountPiasters + FEE_TOLERANCE_PIASTERS;
-
-    // 2. Atomic PostgreSQL transaction with row locks on candidate evidence
-    const txResult = await this.prisma.$transaction(
+    const txResult: TxOutcome = await this.prisma.$transaction(
       async (tx) => {
+        const [{ locked }] = await tx.$queryRaw<[{ locked: boolean }]>`
+          SELECT pg_try_advisory_xact_lock(hashtextextended(${sellerId}, 0)) AS locked
+        `;
+        if (!locked) {
+          return { outcome: 'LOCK_CONTENDED' };
+        }
+
+        const proof = await tx.proof.findUnique({
+          where: { id: proofId },
+          include: {
+            seller: {
+              select: {
+                id: true,
+                ownerPhone: true,
+                matchWindowBeforeMs: true,
+                matchWindowAfterMs: true,
+                waitingDebounceMs: true,
+                retentionDays: true,
+              },
+            },
+            customer: { select: { id: true, phone: true } },
+          },
+        });
+
+        const validStatuses: ProofStatus[] = opts?.unmatchedLagBypass
+          ? [ProofStatus.UNMATCHED]
+          : [ProofStatus.PROCESSING, ProofStatus.WAITING];
+
+        if (!proof || !proof.extractedAmountPiasters || !validStatuses.includes(proof.status)) {
+          return { outcome: 'NOOP' };
+        }
+
+        const recipientPhone = proof.replyToPhone ?? proof.customer?.phone ?? null;
+
+        // 1. Duplicate check on fresh PROCESSING proofs
+        if (proof.status === ProofStatus.PROCESSING) {
+          const dup = await this.duplicates.check(
+            tx,
+            {
+              id: proof.id,
+              sellerId: proof.sellerId,
+              customerId: proof.customerId,
+              isForwarded: proof.isForwarded,
+              extractedRef: proof.extractedRef,
+              imageSha256: proof.imageSha256,
+              imagePhash: proof.imagePhash,
+            },
+            proof.seller.retentionDays,
+          );
+
+          if (
+            dup.kind === 'SELF_RETRY_ALREADY_CONFIRMED' ||
+            dup.kind === 'SELF_RETRY_WAITING'
+          ) {
+            await tx.proof.update({
+              where: { id: proof.id },
+              data: {
+                status: ProofStatus.SUPERSEDED,
+                statusReason: dup.kind,
+              },
+            });
+            await tx.auditLog.create({
+              data: {
+                sellerId: proof.sellerId,
+                entityType: 'PROOF',
+                entityId: proof.id,
+                action: 'PROOF_SELF_RETRY_SUPERSEDED',
+                actorType: 'SYSTEM',
+                payload: { originalProofId: dup.originalProofId, kind: dup.kind },
+              },
+            });
+            return {
+              outcome: 'SELF_RETRY',
+              originalProofId: dup.originalProofId,
+              alreadyConfirmed: dup.kind === 'SELF_RETRY_ALREADY_CONFIRMED',
+              sellerId: proof.sellerId,
+              proofId: proof.id,
+              recipientPhone,
+            };
+          }
+
+          if (dup.kind === 'FRAUD_DUPLICATE') {
+            await tx.proof.update({
+              where: { id: proof.id },
+              data: { status: ProofStatus.SUSPICIOUS, statusReason: dup.reason },
+            });
+            await tx.auditLog.create({
+              data: {
+                sellerId: proof.sellerId,
+                entityType: 'PROOF',
+                entityId: proof.id,
+                action: 'PROOF_FLAGGED_DUPLICATE',
+                actorType: 'SYSTEM',
+                payload: {
+                  reasonCode: dup.reason,
+                  matchedProofId: dup.matchedProofId,
+                  hammingDistance: dup.hammingDistance ?? null,
+                },
+              },
+            });
+            return {
+              outcome: 'SUSPICIOUS',
+              sellerId: proof.sellerId,
+              proofId: proof.id,
+              ownerPhone: proof.seller.ownerPhone,
+              recipientPhone,
+              reasonCode: dup.reason,
+            };
+          }
+        }
+
+        const rawMeta = (proof.extractionRaw ?? {}) as {
+          fields?: { visualAnomalies?: string[] };
+          forensics?: { editingSoftwareFlag?: string | null };
+        };
+
+        const anchorTime = proof.extractedTime ?? proof.createdAt;
+        const windowStart = new Date(anchorTime.getTime() - proof.seller.matchWindowBeforeMs);
+        const windowEnd = new Date(anchorTime.getTime() + proof.seller.matchWindowAfterMs);
+        const minAmount =
+          proof.extractedAmountPiasters > FEE_TOLERANCE_PIASTERS
+            ? proof.extractedAmountPiasters - FEE_TOLERANCE_PIASTERS
+            : 1n;
+        const maxAmount = proof.extractedAmountPiasters + FEE_TOLERANCE_PIASTERS;
+
+        const [{ count: competingCountBigInt }] = await tx.$queryRaw<[{ count: bigint }]>`
+          SELECT COUNT(*)::bigint AS count
+          FROM "Proof"
+          WHERE "sellerId" = ${proof.sellerId}
+            AND "id" <> ${proof.id}
+            AND "status" IN ('PROCESSING', 'WAITING')
+            AND "extractedAmountPiasters" BETWEEN ${minAmount} AND ${maxAmount}
+            AND COALESCE("extractedTime", "createdAt") BETWEEN ${windowStart} AND ${windowEnd}
+        `;
+        const competingOpenProofsCount = Number(competingCountBigInt);
+
+        const refBypassClause = proof.extractedRef
+          ? Prisma.sql`OR ("parsedRef" IS NOT NULL AND ("parsedRef" = ${proof.extractedRef} OR RIGHT("parsedRef", 8) = RIGHT(${proof.extractedRef}, 8)))`
+          : Prisma.empty;
+
+        const timeClause =
+          opts?.unmatchedLagBypass && proof.extractedRef
+            ? Prisma.sql`(
+                COALESCE("parsedTime", "receivedAt") BETWEEN ${windowStart} AND ${windowEnd}
+                ${refBypassClause}
+              )`
+            : Prisma.sql`(
+                COALESCE("parsedTime", "receivedAt") BETWEEN ${windowStart} AND ${windowEnd}
+                ${refBypassClause}
+              )`;
+
         const rows = await tx.$queryRaw<LockedEvidenceRow[]>`
           SELECT
             "id",
@@ -173,7 +352,7 @@ export class MatchingProcessor extends WorkerHost {
           WHERE "sellerId" = ${proof.sellerId}
             AND "claimedByProofId" IS NULL
             AND "parsedAmountPiasters" BETWEEN ${minAmount} AND ${maxAmount}
-            AND "receivedAt" BETWEEN ${windowStart} AND ${windowEnd}
+            AND ${timeClause}
           ORDER BY "receivedAt" ASC
           FOR UPDATE SKIP LOCKED
         `;
@@ -181,19 +360,19 @@ export class MatchingProcessor extends WorkerHost {
         const candidates: EvidenceCandidate[] = rows.map((r) => ({
           ...r,
           parsedAmountPiasters: BigInt(r.parsedAmountPiasters),
-          parsedTime: r.parsedTime ?? r.receivedAt,
         }));
 
         const decision = scoreAndDecide(
           {
             id: proof.id,
-            extractedAmountPiasters: proof.extractedAmountPiasters!,
+            extractedAmountPiasters: proof.extractedAmountPiasters,
             extractedRef: proof.extractedRef,
             extractedTime: proof.extractedTime,
             extractedSender: proof.extractedSender,
             createdAt: proof.createdAt,
             visualAnomalies: rawMeta.fields?.visualAnomalies ?? [],
             editingSoftwareFlag: rawMeta.forensics?.editingSoftwareFlag ?? null,
+            competingOpenProofsCount,
           },
           candidates,
         );
@@ -234,7 +413,17 @@ export class MatchingProcessor extends WorkerHost {
             },
           });
 
-          return { outcome: 'CONFIRMED' as const };
+          return {
+            outcome: 'CONFIRMED',
+            sellerId: proof.sellerId,
+            proofId: proof.id,
+            recipientPhone,
+          };
+        }
+
+        // For 24h UNMATCHED evidence arrivals, never revert non-confirmed proofs
+        if (opts?.unmatchedLagBypass) {
+          return { outcome: 'NOOP' };
         }
 
         if (decision.outcome === 'SUSPICIOUS') {
@@ -259,79 +448,101 @@ export class MatchingProcessor extends WorkerHost {
           });
 
           return {
-            outcome: 'SUSPICIOUS' as const,
+            outcome: 'SUSPICIOUS',
+            sellerId: proof.sellerId,
+            proofId: proof.id,
+            ownerPhone: proof.seller.ownerPhone,
+            recipientPhone,
             reasonCode: decision.reasonCode,
-            reasons: decision.reasons,
           };
         }
 
-        // WAITING: only set expiresAt on initial transition from PROCESSING
         const expiresAt = proof.expiresAt ?? new Date(Date.now() + proof.seller.matchWindowAfterMs);
-        if (proof.status === 'PROCESSING') {
+        if (proof.status === ProofStatus.PROCESSING) {
           await tx.proof.update({
             where: { id: proof.id },
             data: { status: ProofStatus.WAITING, expiresAt },
           });
         }
 
-        return { outcome: 'WAITING' as const, expiresAt, wasProcessing: proof.status === 'PROCESSING' };
+        return {
+          outcome: 'WAITING',
+          sellerId: proof.sellerId,
+          proofId: proof.id,
+          recipientPhone,
+          waitingDebounceMs: proof.seller.waitingDebounceMs,
+          expiresAt,
+          wasProcessing: proof.status === ProofStatus.PROCESSING,
+        };
       },
       { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 3000, timeout: 10000 },
     );
 
-    // 3. Post-commit side effects (never hold DB locks while calling Redis/WhatsApp)
-    if (txResult.outcome === 'CONFIRMED') {
-      // Cancel debounced WAITING reply if evidence arrived within the 20s window
-      await this.repliesQueue.remove(`waiting-reply:${proof.id}`);
-      await this.matchingQueue.remove(`expire-proof:${proof.id}`);
+    if (txResult.outcome === 'LOCK_CONTENDED') {
+      return 'LOCK_CONTENDED';
+    }
+    if (txResult.outcome === 'NOOP') {
+      return 'DONE';
+    }
 
-      const recipientPhone = proof.replyToPhone ?? proof.customer?.phone;
-      if (recipientPhone) {
+    if (txResult.outcome === 'SELF_RETRY') {
+      if (txResult.alreadyConfirmed && txResult.recipientPhone) {
         await this.repliesQueue.add('customer-confirmed', {
-          sellerId: proof.sellerId,
-          customerPhone: recipientPhone,
-          proofId: proof.id,
+          sellerId: txResult.sellerId,
+          customerPhone: txResult.recipientPhone,
+          proofId: txResult.proofId,
         });
       }
-      return;
+      return 'DONE';
+    }
+
+    if (txResult.outcome === 'CONFIRMED') {
+      await this.repliesQueue.remove(`waiting-reply:${txResult.proofId}`);
+      await this.matchingQueue.remove(`expire-proof:${txResult.proofId}`);
+
+      if (txResult.recipientPhone) {
+        await this.repliesQueue.add('customer-confirmed', {
+          sellerId: txResult.sellerId,
+          customerPhone: txResult.recipientPhone,
+          proofId: txResult.proofId,
+        });
+      }
+      return 'CONFIRMED';
     }
 
     if (txResult.outcome === 'SUSPICIOUS') {
-      await this.repliesQueue.remove(`waiting-reply:${proof.id}`);
-      await this.matchingQueue.remove(`expire-proof:${proof.id}`);
+      await this.repliesQueue.remove(`waiting-reply:${txResult.proofId}`);
+      await this.matchingQueue.remove(`expire-proof:${txResult.proofId}`);
 
-      const recipientPhone = proof.replyToPhone ?? proof.customer?.phone;
-      if (recipientPhone) {
+      if (txResult.recipientPhone) {
         await this.repliesQueue.add('customer-suspicious', {
-          sellerId: proof.sellerId,
-          customerPhone: recipientPhone,
-          proofId: proof.id,
+          sellerId: txResult.sellerId,
+          customerPhone: txResult.recipientPhone,
+          proofId: txResult.proofId,
         });
       }
       await this.repliesQueue.add('owner-alert', {
-        sellerId: proof.sellerId,
-        ownerPhone: proof.seller.ownerPhone,
-        proofId: proof.id,
+        sellerId: txResult.sellerId,
+        ownerPhone: txResult.ownerPhone,
+        proofId: txResult.proofId,
         status: 'SUSPICIOUS',
         reasonCode: txResult.reasonCode,
       });
-      return;
+      return 'DONE';
     }
 
     if (txResult.wasProcessing) {
-      // Debounce WAITING reply by 20s to stay inside Meta's 1,000 free monthly messages
-      const recipientPhone = proof.replyToPhone ?? proof.customer?.phone;
-      if (recipientPhone) {
+      if (txResult.recipientPhone) {
         await this.repliesQueue.add(
           'customer-waiting',
           {
-            sellerId: proof.sellerId,
-            customerPhone: recipientPhone,
-            proofId: proof.id,
+            sellerId: txResult.sellerId,
+            customerPhone: txResult.recipientPhone,
+            proofId: txResult.proofId,
           },
           {
-            jobId: `waiting-reply:${proof.id}`,
-            delay: proof.seller.waitingDebounceMs,
+            jobId: `waiting-reply:${txResult.proofId}`,
+            delay: txResult.waitingDebounceMs,
           },
         );
       }
@@ -339,13 +550,20 @@ export class MatchingProcessor extends WorkerHost {
       const ttlMs = Math.max(1000, txResult.expiresAt.getTime() - Date.now());
       await this.matchingQueue.add(
         'expire-waiting-proof',
-        { sellerId: proof.sellerId, proofId: proof.id },
-        { jobId: `expire-proof:${proof.id}`, delay: ttlMs },
+        { sellerId: txResult.sellerId, proofId: txResult.proofId },
+        { jobId: `expire-proof:${txResult.proofId}`, delay: ttlMs },
       );
     }
+
+    return 'DONE';
   }
 
-  private async matchWaitingProofsForEvidence(sellerId: string, evidenceId: string): Promise<void> {
+  private async matchWaitingProofsForEvidence(
+    sellerId: string,
+    evidenceId: string,
+    job: Job<MatchingJobData>,
+    token?: string,
+  ): Promise<void> {
     const evidence = await this.prisma.evidence.findUnique({
       where: { id: evidenceId },
       select: { id: true, parsedAmountPiasters: true, claimedByProofId: true },
@@ -358,7 +576,6 @@ export class MatchingProcessor extends WorkerHost {
         : 1n;
     const maxAmount = evidence.parsedAmountPiasters + FEE_TOLERANCE_PIASTERS;
 
-    // Re-evaluate oldest WAITING proofs whose amount is in range
     const waitingProofs = await this.prisma.proof.findMany({
       where: {
         sellerId,
@@ -367,31 +584,71 @@ export class MatchingProcessor extends WorkerHost {
       },
       select: { id: true },
       orderBy: { createdAt: 'asc' },
-      take: 10,
+      take: 20,
     });
 
     for (const wp of waitingProofs) {
-      await this.matchProof(wp.id);
+      const res = await this.matchProof(sellerId, wp.id);
+      if (res === 'LOCK_CONTENDED') {
+        const jitterMs = 200 + Math.floor(Math.random() * 250);
+        await job.moveToDelayed(Date.now() + jitterMs, token);
+        throw new DelayedError();
+      }
+      const refreshed = await this.prisma.evidence.findUnique({
+        where: { id: evidenceId },
+        select: { claimedByProofId: true },
+      });
+      if (refreshed?.claimedByProofId) return;
+    }
+
+    // Second pass: late-arriving evidence vs 24h UNMATCHED proofs (Tier 1 / clean CONFIRMED only)
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 3600_000);
+    const unmatchedProofs = await this.prisma.proof.findMany({
+      where: {
+        sellerId,
+        status: ProofStatus.UNMATCHED,
+        statusReason: 'EVIDENCE_TIMEOUT',
+        extractedAmountPiasters: evidence.parsedAmountPiasters,
+        createdAt: { gte: twentyFourHoursAgo },
+      },
+      select: { id: true },
+      orderBy: { createdAt: 'asc' },
+      take: 20,
+    });
+
+    for (const up of unmatchedProofs) {
+      const res = await this.matchProof(sellerId, up.id, { unmatchedLagBypass: true });
+      if (res === 'LOCK_CONTENDED') {
+        const jitterMs = 200 + Math.floor(Math.random() * 250);
+        await job.moveToDelayed(Date.now() + jitterMs, token);
+        throw new DelayedError();
+      }
+      const refreshed = await this.prisma.evidence.findUnique({
+        where: { id: evidenceId },
+        select: { claimedByProofId: true },
+      });
+      if (refreshed?.claimedByProofId) return;
     }
   }
 
   private async expireWaitingProof(proofId: string): Promise<void> {
-    const proof = await this.prisma.proof.findUnique({
-      where: { id: proofId },
-      include: {
-        seller: { select: { ownerPhone: true } },
-        customer: { select: { phone: true } },
-      },
-    });
-
-    if (!proof || proof.status !== ProofStatus.WAITING) return;
-
-    await this.prisma.$transaction([
-      this.prisma.proof.update({
-        where: { id: proof.id },
+    const expired = await this.prisma.$transaction(async (tx) => {
+      const updated = await tx.proof.updateMany({
+        where: { id: proofId, status: ProofStatus.WAITING },
         data: { status: ProofStatus.UNMATCHED, statusReason: 'EVIDENCE_TIMEOUT' },
-      }),
-      this.prisma.auditLog.create({
+      });
+      if (updated.count === 0) return null;
+
+      const proof = await tx.proof.findUnique({
+        where: { id: proofId },
+        include: {
+          seller: { select: { ownerPhone: true } },
+          customer: { select: { phone: true } },
+        },
+      });
+      if (!proof) return null;
+
+      await tx.auditLog.create({
         data: {
           sellerId: proof.sellerId,
           entityType: 'PROOF',
@@ -400,68 +657,26 @@ export class MatchingProcessor extends WorkerHost {
           actorType: 'SYSTEM',
           payload: { expiresAt: proof.expiresAt?.toISOString() },
         },
-      }),
-    ]);
+      });
+      return proof;
+    });
 
-    const recipientPhone = proof.replyToPhone ?? proof.customer?.phone;
+    if (!expired) return;
+
+    const recipientPhone = expired.replyToPhone ?? expired.customer?.phone;
     if (recipientPhone) {
       await this.repliesQueue.add('customer-waiting-longer', {
-        sellerId: proof.sellerId,
+        sellerId: expired.sellerId,
         customerPhone: recipientPhone,
-        proofId: proof.id,
+        proofId: expired.id,
       });
     }
     await this.repliesQueue.add('owner-alert', {
-      sellerId: proof.sellerId,
-      ownerPhone: proof.seller.ownerPhone,
-      proofId: proof.id,
+      sellerId: expired.sellerId,
+      ownerPhone: expired.seller.ownerPhone,
+      proofId: expired.id,
       status: 'UNMATCHED',
       reasonCode: 'EVIDENCE_TIMEOUT',
-    });
-  }
-
-  private async markSuspicious(
-    proof: {
-      id: string;
-      sellerId: string;
-      replyToPhone: string | null;
-      seller: { ownerPhone: string };
-      customer: { phone: string } | null;
-    },
-    reasonCode: string,
-    details: Record<string, unknown>,
-  ): Promise<void> {
-    await this.prisma.$transaction([
-      this.prisma.proof.update({
-        where: { id: proof.id },
-        data: { status: ProofStatus.SUSPICIOUS, statusReason: reasonCode },
-      }),
-      this.prisma.auditLog.create({
-        data: {
-          sellerId: proof.sellerId,
-          entityType: 'PROOF',
-          entityId: proof.id,
-          action: 'PROOF_FLAGGED_DUPLICATE',
-          actorType: 'SYSTEM',
-          payload: { reasonCode, ...details },
-        },
-      }),
-    ]);
-
-    const recipientPhone = proof.replyToPhone ?? proof.customer?.phone;
-    if (recipientPhone) {
-      await this.repliesQueue.add('customer-suspicious', {
-        sellerId: proof.sellerId,
-        customerPhone: recipientPhone,
-        proofId: proof.id,
-      });
-    }
-    await this.repliesQueue.add('owner-alert', {
-      sellerId: proof.sellerId,
-      ownerPhone: proof.seller.ownerPhone,
-      proofId: proof.id,
-      status: 'SUSPICIOUS',
-      reasonCode,
     });
   }
 }

@@ -1,8 +1,24 @@
 import { InjectQueue } from '@nestjs/bullmq';
 import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { DecisionActor, Prisma, ProofStatus } from '../generated/prisma/client.js';
 import { Queue } from 'bullmq';
+import { DecisionActor, Prisma, ProofStatus } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
+
+const FEE_TOLERANCE_PIASTERS = 1500n;
+const OVERRIDEABLE_STATUSES = new Set<ProofStatus>([
+  ProofStatus.WAITING,
+  ProofStatus.SUSPICIOUS,
+  ProofStatus.UNMATCHED,
+]);
+
+function isPgLockTimeoutError(err: unknown): boolean {
+  const anyErr = err as { code?: string; meta?: { code?: string }; message?: string };
+  return (
+    anyErr?.code === '55P03' ||
+    anyErr?.meta?.code === '55P03' ||
+    (typeof anyErr?.message === 'string' && anyErr.message.includes('55P03'))
+  );
+}
 
 @Injectable()
 export class ManualOverrideService {
@@ -18,19 +34,73 @@ export class ManualOverrideService {
     actorRole: DecisionActor;
     actorId: string;
     evidenceId?: string;
+    autoLinkSingleCandidate?: boolean;
     note?: string;
   }) {
-    const proof = await this.prisma.proof.findFirst({
-      where: { id: params.proofId, sellerId: params.sellerId },
-      include: { customer: { select: { phone: true } } },
-    });
-    if (!proof) throw new NotFoundException('Proof not found');
+    let proofRecipient: string | null = null;
 
     try {
       await this.prisma.$transaction(async (tx) => {
-        if (params.evidenceId) {
+        await tx.$executeRaw`SET LOCAL lock_timeout = '2000ms'`;
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${params.sellerId}, 0))`;
+
+        const proof = await tx.proof.findFirst({
+          where: { id: params.proofId, sellerId: params.sellerId },
+          include: {
+            customer: { select: { phone: true } },
+            seller: { select: { matchWindowBeforeMs: true, matchWindowAfterMs: true } },
+          },
+        });
+        if (!proof) throw new NotFoundException('Proof not found');
+        if (!OVERRIDEABLE_STATUSES.has(proof.status)) {
+          throw new ConflictException(`Proof cannot be confirmed from status ${proof.status}`);
+        }
+
+        proofRecipient = proof.replyToPhone ?? proof.customer?.phone ?? null;
+
+        let chosenEvidenceId = params.evidenceId;
+        let statusReason = 'MANUAL_OVERRIDE';
+
+        if (!chosenEvidenceId && params.autoLinkSingleCandidate) {
+          if (proof.extractedAmountPiasters === null) {
+            throw new ConflictException('Proof has no readable amount; resolve from dashboard');
+          }
+          const anchor = proof.extractedTime ?? proof.createdAt;
+          const windowStart = new Date(anchor.getTime() - proof.seller.matchWindowBeforeMs);
+          const windowEnd = new Date(anchor.getTime() + proof.seller.matchWindowAfterMs);
+          const minAmount =
+            proof.extractedAmountPiasters > FEE_TOLERANCE_PIASTERS
+              ? proof.extractedAmountPiasters - FEE_TOLERANCE_PIASTERS
+              : 1n;
+          const maxAmount = proof.extractedAmountPiasters + FEE_TOLERANCE_PIASTERS;
+
+          const candidates = await tx.$queryRaw<Array<{ id: string }>>`
+            SELECT "id"
+            FROM "Evidence"
+            WHERE "sellerId" = ${params.sellerId}
+              AND "claimedByProofId" IS NULL
+              AND "parsedAmountPiasters" BETWEEN ${minAmount} AND ${maxAmount}
+              AND COALESCE("parsedTime", "receivedAt") BETWEEN ${windowStart} AND ${windowEnd}
+            ORDER BY "receivedAt" ASC
+            LIMIT 2
+          `;
+
+          if (candidates.length === 1) {
+            chosenEvidenceId = candidates[0].id;
+          } else if (candidates.length > 1) {
+            throw new ConflictException(
+              'Multiple candidate deposits found; resolve from dashboard',
+            );
+          } else {
+            throw new ConflictException(
+              'No matching unclaimed deposit in window; confirm uncorroborated from dashboard',
+            );
+          }
+        }
+
+        if (chosenEvidenceId) {
           const ev = await tx.evidence.findFirst({
-            where: { id: params.evidenceId, sellerId: params.sellerId, claimedByProofId: null },
+            where: { id: chosenEvidenceId, sellerId: params.sellerId, claimedByProofId: null },
           });
           if (!ev) throw new ConflictException('Evidence already claimed or not found');
 
@@ -49,11 +119,13 @@ export class ManualOverrideService {
               note: params.note,
             },
           });
+        } else {
+          statusReason = 'MANUAL_OVERRIDE_UNCORROBORATED';
         }
 
         await tx.proof.update({
           where: { id: proof.id },
-          data: { status: ProofStatus.CONFIRMED, statusReason: 'MANUAL_OVERRIDE' },
+          data: { status: ProofStatus.CONFIRMED, statusReason },
         });
 
         await tx.auditLog.create({
@@ -64,26 +136,32 @@ export class ManualOverrideService {
             action: 'MANUAL_OVERRIDE_CONFIRM',
             actorType: params.actorRole,
             actorId: params.actorId,
-            payload: { evidenceId: params.evidenceId ?? null, note: params.note ?? null },
+            payload: {
+              evidenceId: chosenEvidenceId ?? null,
+              uncorroborated: !chosenEvidenceId,
+              note: params.note ?? null,
+            },
           },
         });
       });
     } catch (err) {
+      if (isPgLockTimeoutError(err)) {
+        throw new ConflictException('Matching busy, retry momentarily');
+      }
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
         throw new ConflictException('Evidence was claimed concurrently');
       }
       throw err;
     }
 
-    await this.repliesQueue.remove(`waiting-reply:${proof.id}`);
-    await this.matchingQueue.remove(`expire-proof:${proof.id}`);
+    await this.repliesQueue.remove(`waiting-reply:${params.proofId}`);
+    await this.matchingQueue.remove(`expire-proof:${params.proofId}`);
 
-    const recipientPhone = proof.replyToPhone ?? proof.customer?.phone;
-    if (recipientPhone) {
+    if (proofRecipient) {
       await this.repliesQueue.add('customer-confirmed', {
         sellerId: params.sellerId,
-        customerPhone: recipientPhone,
-        proofId: proof.id,
+        customerPhone: proofRecipient,
+        proofId: params.proofId,
       });
     }
 
@@ -95,47 +173,62 @@ export class ManualOverrideService {
     proofId: string;
     actorRole: DecisionActor;
     actorId: string;
-    isFraud: boolean;
+    isFraud?: boolean;
     note?: string;
   }) {
-    const proof = await this.prisma.proof.findFirst({
-      where: { id: params.proofId, sellerId: params.sellerId },
-    });
-    if (!proof) throw new NotFoundException('Proof not found');
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        await tx.$executeRaw`SET LOCAL lock_timeout = '2000ms'`;
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${params.sellerId}, 0))`;
 
-    await this.prisma.$transaction(async (tx) => {
-      await tx.proof.update({
-        where: { id: proof.id },
-        data: {
-          status: ProofStatus.REJECTED,
-          statusReason: params.isFraud ? 'MANUAL_REJECT_FRAUD' : 'MANUAL_REJECT',
-        },
-      });
-
-      if (params.isFraud && proof.customerId) {
-        await tx.customer.update({
-          where: { id: proof.customerId },
-          data: { trustScore: { decrement: 35 } },
+        const proof = await tx.proof.findFirst({
+          where: { id: params.proofId, sellerId: params.sellerId },
         });
-      }
+        if (!proof) throw new NotFoundException('Proof not found');
+        if (!OVERRIDEABLE_STATUSES.has(proof.status)) {
+          throw new ConflictException(`Proof cannot be rejected from status ${proof.status}`);
+        }
 
-      await tx.auditLog.create({
-        data: {
-          sellerId: params.sellerId,
-          entityType: 'PROOF',
-          entityId: proof.id,
-          action: 'MANUAL_OVERRIDE_REJECT',
-          actorType: params.actorRole,
-          actorId: params.actorId,
-          payload: { isFraud: params.isFraud, note: params.note ?? null },
-        },
+        const effectiveFraud = params.isFraud ?? proof.status === ProofStatus.SUSPICIOUS;
+
+        await tx.proof.update({
+          where: { id: proof.id },
+          data: {
+            status: ProofStatus.REJECTED,
+            statusReason: effectiveFraud ? 'MANUAL_REJECT_FRAUD' : 'MANUAL_REJECT',
+          },
+        });
+
+        if (effectiveFraud && proof.customerId) {
+          await tx.$executeRaw`
+            UPDATE "Customer"
+            SET "trustScore" = GREATEST(0, "trustScore" - 35)
+            WHERE "id" = ${proof.customerId}
+          `;
+        }
+
+        await tx.auditLog.create({
+          data: {
+            sellerId: params.sellerId,
+            entityType: 'PROOF',
+            entityId: proof.id,
+            action: 'MANUAL_OVERRIDE_REJECT',
+            actorType: params.actorRole,
+            actorId: params.actorId,
+            payload: { isFraud: effectiveFraud, note: params.note ?? null },
+          },
+        });
       });
-    });
+    } catch (err) {
+      if (isPgLockTimeoutError(err)) {
+        throw new ConflictException('Matching busy, retry momentarily');
+      }
+      throw err;
+    }
 
-    await this.repliesQueue.remove(`waiting-reply:${proof.id}`);
-    await this.matchingQueue.remove(`expire-proof:${proof.id}`);
+    await this.repliesQueue.remove(`waiting-reply:${params.proofId}`);
+    await this.matchingQueue.remove(`expire-proof:${params.proofId}`);
 
-    // Never auto-accuse the customer; seller handles rejected chats directly
     return { ok: true, status: ProofStatus.REJECTED };
   }
 }

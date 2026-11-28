@@ -20,9 +20,14 @@ export const REASON_LABELS_AR: Record<string, string> = {
   DUPLICATE_IMAGE_PHASH: 'صورة إيصال مكررة أو مقصوصة',
   AMBIGUOUS_MULTIPLE_EVIDENCE: 'فيه أكتر من تحويل بنفس المبلغ في نفس الوقت',
   AMOUNT_FEE_MISMATCH: 'فرق بسيط في المبلغ بين الإيصال والتحويل',
+  AMOUNT_MISMATCH: 'المبلغ مختلف عن إشعار التحويل',
   VISUAL_TAMPER_WARNING: 'مؤشر تعديل على صورة الإيصال',
   REF_MISMATCH: 'الرقم المرجعي مختلف عن إشعار البنك',
+  SENDER_OR_CONFIDENCE_CHECK: 'اسم المرسل مختلف أو دقة القراءة منخفضة',
+  MISSING_REF_UNCORROBORATED: 'لا يوجد رقم مرجعي ولا تطابق كافي لاسم المرسل',
   EVIDENCE_TIMEOUT: 'انتهت مهلة الانتظار ولم يصل إشعار تحويل',
+  VISION_UNAVAILABLE: 'تعذر قراءة الصورة تلقائياً — يرجى المراجعة اليدوية',
+  UNREADABLE_IMAGE: 'الصورة غير واضحة أو تعذر قراءة المبلغ',
 };
 
 export function resolveTemplate(

@@ -1,3 +1,5 @@
+import { transliterateArabicLatinSkeleton } from '../common/normalize.js';
+
 export interface ProofForMatching {
   id: string;
   extractedAmountPiasters: bigint;
@@ -7,13 +9,14 @@ export interface ProofForMatching {
   createdAt: Date;
   visualAnomalies: string[];
   editingSoftwareFlag: string | null;
+  competingOpenProofsCount?: number;
 }
 
 export interface EvidenceCandidate {
   id: string;
   parsedAmountPiasters: bigint;
   parsedRef: string | null;
-  parsedTime: Date;
+  parsedTime: Date | null;
   parsedSender: string | null;
   parseConfidence: number;
   receivedAt: Date;
@@ -23,7 +26,7 @@ export interface CandidateScore {
   evidenceId: string;
   score: number;
   refMatch: 'EXACT' | 'SUFFIX' | 'MISMATCH' | 'NONE';
-  amountMatch: 'EXACT' | 'FEE_DELTA';
+  amountMatch: 'EXACT' | 'FEE_DELTA' | 'MISMATCH';
   nameSimilarity: number | null;
   timeDeltaSec: number;
   reasons: string[];
@@ -33,6 +36,9 @@ export type MatchDecision =
   | { outcome: 'CONFIRMED'; winner: CandidateScore; reasons: string[] }
   | { outcome: 'SUSPICIOUS'; reasonCode: string; candidates: CandidateScore[]; reasons: string[] }
   | { outcome: 'WAITING' };
+
+const FEE_TOLERANCE_PIASTERS = 1500n;
+const PHONE_RE = /01\d{9}/;
 
 function levenshtein(a: string, b: string): number {
   const m = a.length;
@@ -53,14 +59,21 @@ function levenshtein(a: string, b: string): number {
   return dp[n];
 }
 
+function isPhoneOnlyTokens(tokens: string[]): boolean {
+  return tokens.length > 0 && tokens.every((t) => /^\d+$/.test(t));
+}
+
+function hasAlphaTokens(tokens: string[]): boolean {
+  return tokens.some((t) => /[a-z\u0621-\u064A]/i.test(t));
+}
+
 /**
  * Compares normalized Arabic/Latin sender names or @instapay handles.
- * Returns null if either side is missing (common in bank SMS).
+ * Returns null if either side is missing or comparing phone-only vs alphabetic-only strings.
  */
 export function computeSenderSimilarity(a?: string | null, b?: string | null): number | null {
   if (!a || !b) return null;
 
-  // Strip @instapay suffix and split into tokens
   const clean = (s: string) =>
     s
       .replace(/@instapay/g, '')
@@ -72,18 +85,35 @@ export function computeSenderSimilarity(a?: string | null, b?: string | null): n
   const tokensB = clean(b);
   if (tokensA.length === 0 || tokensB.length === 0) return null;
 
-  // Phone number exact tail match (e.g. VF-Cash 010xxxxxxxx)
-  const phoneA = a.match(/01\d{9}/)?.[0];
-  const phoneB = b.match(/01\d{9}/)?.[0];
+  const phoneA = a.match(PHONE_RE)?.[0];
+  const phoneB = b.match(PHONE_RE)?.[0];
   if (phoneA && phoneB) return phoneA === phoneB ? 1.0 : 0.0;
 
-  // Best pairwise token similarity
+  if (
+    (isPhoneOnlyTokens(tokensA) && !phoneB && hasAlphaTokens(tokensB)) ||
+    (isPhoneOnlyTokens(tokensB) && !phoneA && hasAlphaTokens(tokensA))
+  ) {
+    return null;
+  }
+
   let matched = 0;
   for (const ta of tokensA) {
+    const skelA = transliterateArabicLatinSkeleton(ta);
     let best = 0;
     for (const tb of tokensB) {
       const maxLen = Math.max(ta.length, tb.length);
-      const sim = 1 - levenshtein(ta, tb) / maxLen;
+      const rawSim = 1 - levenshtein(ta, tb) / maxLen;
+
+      const skelB = transliterateArabicLatinSkeleton(tb);
+      let skelSim = 0;
+      if (skelA.length > 0 && skelB.length > 0) {
+        skelSim =
+          skelA === skelB
+            ? 1.0
+            : 1 - levenshtein(skelA, skelB) / Math.max(skelA.length, skelB.length);
+      }
+
+      const sim = Math.max(rawSim, skelSim);
       if (sim > best) best = sim;
     }
     if (best >= 0.72) matched++;
@@ -113,6 +143,8 @@ export function scoreAndDecide(
   }
 
   const anchorTime = proof.extractedTime ?? proof.createdAt;
+  const timestampFallback = proof.extractedTime === null;
+  const competingOpenProofsCount = proof.competingOpenProofsCount ?? 0;
   const hasTamperWarning =
     proof.visualAnomalies.length > 0 || proof.editingSoftwareFlag !== null;
 
@@ -125,13 +157,17 @@ export function scoreAndDecide(
         ? ev.parsedAmountPiasters - proof.extractedAmountPiasters
         : proof.extractedAmountPiasters - ev.parsedAmountPiasters;
 
-    const amountMatch: 'EXACT' | 'FEE_DELTA' = amountDiff === 0n ? 'EXACT' : 'FEE_DELTA';
+    const amountMatch: 'EXACT' | 'FEE_DELTA' | 'MISMATCH' =
+      amountDiff === 0n ? 'EXACT' : amountDiff <= FEE_TOLERANCE_PIASTERS ? 'FEE_DELTA' : 'MISMATCH';
     if (amountMatch === 'EXACT') {
       score += 40;
       reasons.push('EXACT_AMOUNT');
-    } else {
+    } else if (amountMatch === 'FEE_DELTA') {
       score += 10;
       reasons.push(`AMOUNT_DELTA_PIASTERS_${amountDiff.toString()}`);
+    } else {
+      score -= 50;
+      reasons.push('AMOUNT_MISMATCH');
     }
 
     const refMatch = compareRefs(proof.extractedRef, ev.parsedRef);
@@ -146,9 +182,8 @@ export function scoreAndDecide(
       reasons.push('REF_MISMATCH');
     }
 
-    const timeDeltaSec = Math.round(
-      Math.abs(ev.receivedAt.getTime() - anchorTime.getTime()) / 1000,
-    );
+    const evTime = ev.parsedTime ?? ev.receivedAt;
+    const timeDeltaSec = Math.round(Math.abs(evTime.getTime() - anchorTime.getTime()) / 1000);
     if (timeDeltaSec <= 180) {
       score += 15;
       reasons.push(`TIME_DELTA_${timeDeltaSec}S`);
@@ -190,7 +225,6 @@ export function scoreAndDecide(
   const exactAmountScored = scored.filter((c) => c.amountMatch === 'EXACT');
   const best = scored[0];
 
-  // Tampering advisory: never auto-confirm when image forensics flagged edits
   if (hasTamperWarning) {
     const flags = [
       ...proof.visualAnomalies.map((a) => `VISUAL_${a.toUpperCase()}`),
@@ -204,11 +238,12 @@ export function scoreAndDecide(
     };
   }
 
-  // TIER 1: Deterministic exact amount + exact/suffix reference match
+  // TIER 1: Single unclaimed exact-amount candidate matching ref without sender contradiction
   const tier1Matches = exactAmountScored.filter(
     (c) =>
       (c.refMatch === 'EXACT' || c.refMatch === 'SUFFIX') &&
-      !c.reasons.includes('LOW_PARSER_CONFIDENCE'),
+      !c.reasons.includes('LOW_PARSER_CONFIDENCE') &&
+      (c.nameSimilarity === null || c.nameSimilarity > 0.2),
   );
   if (tier1Matches.length === 1) {
     return {
@@ -218,15 +253,32 @@ export function scoreAndDecide(
     };
   }
 
-  // TIER 2: Single unclaimed exact-amount candidate with no contradictions
+  // Single exact-amount conflict & Tier 2 strict missing-reference rule
   if (exactAmountScored.length === 1) {
     const only = exactAmountScored[0];
-    const hasContradiction =
-      only.refMatch === 'MISMATCH' ||
-      (only.nameSimilarity !== null && only.nameSimilarity <= 0.2) ||
-      only.reasons.includes('LOW_PARSER_CONFIDENCE');
+    if (only.refMatch === 'MISMATCH') {
+      return {
+        outcome: 'SUSPICIOUS',
+        reasonCode: 'REF_MISMATCH',
+        candidates: [only],
+        reasons: only.reasons,
+      };
+    }
 
-    if (!hasContradiction) {
+    if (
+      only.reasons.includes('LOW_PARSER_CONFIDENCE') ||
+      (only.nameSimilarity !== null && only.nameSimilarity <= 0.2)
+    ) {
+      return {
+        outcome: 'SUSPICIOUS',
+        reasonCode: 'SENDER_OR_CONFIDENCE_CHECK',
+        candidates: [only],
+        reasons: only.reasons,
+      };
+    }
+
+    const identityCorroborated = only.nameSimilarity !== null && only.nameSimilarity >= 0.7;
+    if (!timestampFallback && competingOpenProofsCount === 0 && identityCorroborated) {
       return {
         outcome: 'CONFIRMED',
         winner: only,
@@ -236,15 +288,19 @@ export function scoreAndDecide(
 
     return {
       outcome: 'SUSPICIOUS',
-      reasonCode: only.refMatch === 'MISMATCH' ? 'REF_MISMATCH' : 'SENDER_OR_CONFIDENCE_CHECK',
+      reasonCode: 'MISSING_REF_UNCORROBORATED',
       candidates: [only],
-      reasons: only.reasons,
+      reasons: ['MISSING_REF_UNCORROBORATED', ...only.reasons],
     };
   }
 
-  // TIER 3: Multiple exact-amount candidates (collision) or fee-delta-only candidates
+  // TIER 3: Multiple exact-amount candidates, small fee tolerance, or large amount mismatch
   const reasonCode =
-    exactAmountScored.length > 1 ? 'AMBIGUOUS_MULTIPLE_EVIDENCE' : 'AMOUNT_FEE_MISMATCH';
+    exactAmountScored.length > 1
+      ? 'AMBIGUOUS_MULTIPLE_EVIDENCE'
+      : scored.some((c) => c.amountMatch === 'FEE_DELTA')
+        ? 'AMOUNT_FEE_MISMATCH'
+        : 'AMOUNT_MISMATCH';
 
   return {
     outcome: 'SUSPICIOUS',

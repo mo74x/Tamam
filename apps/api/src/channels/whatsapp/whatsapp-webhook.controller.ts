@@ -6,56 +6,82 @@ import {
   Get,
   HttpCode,
   HttpStatus,
+  Inject,
   Logger,
+  Optional,
   Post,
   Query,
   Res,
   UseGuards,
 } from '@nestjs/common';
-import { DecisionActor } from '../../generated/prisma/client.js';
+import { SkipThrottle } from '@nestjs/throttler';
 import { Queue } from 'bullmq';
 import { timingSafeEqual } from 'crypto';
 import type { Response } from 'express';
-import { ManualOverrideService } from '../../matching/manual-override.service.js';
+import type { Redis } from 'ioredis';
+import { ChannelType } from '../../generated/prisma/client.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { WhatsAppSignatureGuard } from './whatsapp-signature.guard.js';
 
 const IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+const EGYPT_CAPTION_PHONE_RE = /(?:\+?20|0)(1[0125]\d{8})/;
+
+interface WebhookMessage {
+  id: string;
+  from: string;
+  to?: string;
+  recipient_id?: string;
+  timestamp: string;
+  type: string;
+  image?: { id: string; mime_type?: string; url?: string; caption?: string };
+  document?: {
+    id: string;
+    mime_type?: string;
+    url?: string;
+    filename?: string;
+    caption?: string;
+  };
+  button?: { payload?: string; text?: string };
+  interactive?: { button_reply?: { id?: string } };
+}
+
+interface WebhookChangeValue {
+  metadata?: { phone_number_id?: string };
+  contacts?: Array<{ wa_id?: string; profile?: { name?: string } }>;
+  message_echoes?: WebhookMessage[];
+  messages?: WebhookMessage[];
+}
 
 interface MetaWebhookPayload {
   object?: string;
   entry?: Array<{
     changes?: Array<{
       field?: string;
-      value?: {
-        metadata?: { phone_number_id?: string };
-        contacts?: Array<{ wa_id?: string; profile?: { name?: string } }>;
-        messages?: Array<{
-          id: string;
-          from: string;
-          timestamp: string;
-          type: string;
-          image?: { id: string; mime_type?: string; url?: string };
-          document?: { id: string; mime_type?: string; url?: string; filename?: string };
-          button?: { payload?: string; text?: string };
-          interactive?: { button_reply?: { id?: string } };
-        }>;
-      };
+      value?: WebhookChangeValue;
     }>;
   }>;
 }
 
+@SkipThrottle()
 @Controller('webhooks/whatsapp')
 export class WhatsAppWebhookController {
   private readonly logger = new Logger(WhatsAppWebhookController.name);
-  private readonly verifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN ?? '';
-  private readonly alertPhoneNumberId = process.env.TAMAM_ALERT_PHONE_NUMBER_ID ?? '';
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly manualOverride: ManualOverrideService,
     @InjectQueue('proof-ingest') private readonly proofQueue: Queue,
+    @InjectQueue('matching') private readonly matchingQueue: Queue,
+    @InjectQueue('replies') private readonly repliesQueue: Queue,
+    @Optional() @Inject('REDIS_CLIENT') private readonly redis?: Redis,
   ) {}
+
+  private get verifyToken(): string {
+    return process.env.META_WEBHOOK_VERIFY_TOKEN ?? '';
+  }
+
+  private get alertPhoneNumberId(): string {
+    return process.env.TAMAM_ALERT_PHONE_NUMBER_ID ?? '';
+  }
 
   @Get()
   verifyWebhook(
@@ -89,15 +115,22 @@ export class WhatsAppWebhookController {
 
     for (const entry of payload.entry ?? []) {
       for (const change of entry.changes ?? []) {
-        if (change.field !== 'messages') continue;
         const value = change.value;
         const phoneNumberId = value?.metadata?.phone_number_id;
-        if (!phoneNumberId || !value?.messages?.length) continue;
+        if (!phoneNumberId) continue;
 
-        // Route 1: Owner quick-reply button taps on Tamam's alert number
-        if (phoneNumberId === this.alertPhoneNumberId) {
+        // Track seller manual replies on WhatsApp Coexistence numbers for 15m suppression
+        if (change.field === 'smb_message_echoes') {
+          await this.handleCoexistenceEchoes(phoneNumberId, value);
+          continue;
+        }
+
+        if (change.field !== 'messages' || !value?.messages?.length) continue;
+
+        // Route 1: Tamam shared alert number (owner action buttons + forwarded receipts)
+        if (this.alertPhoneNumberId && phoneNumberId === this.alertPhoneNumberId) {
           for (const msg of value.messages) {
-            await this.handleOwnerAction(msg);
+            await this.handleAlertNumberMessage(msg);
           }
           continue;
         }
@@ -117,10 +150,9 @@ export class WhatsAppWebhookController {
           const media = this.extractReceiptMedia(msg);
           if (!media) continue;
 
-          const customerPhone = msg.from.startsWith('+') ? msg.from : `+${msg.from}`;
+          const customerPhone = this.normalizeE164(msg.from);
           const receivedAt = new Date(Number(msg.timestamp) * 1000).toISOString();
 
-          // Pass mediaId only (not base64) to keep Redis memory flat under bursts
           await this.proofQueue.add(
             'ingest-whatsapp-media',
             {
@@ -135,10 +167,10 @@ export class WhatsAppWebhookController {
               receivedAt,
             },
             {
-              jobId: `wamid:${msg.id}`, // Meta webhook duplicate protection
+              jobId: `wamid:${msg.id}`,
               attempts: 4,
               backoff: { type: 'exponential', delay: 2000 },
-              removeOnComplete: 500,
+              removeOnComplete: { age: 86_400 },
             },
           );
         }
@@ -148,16 +180,52 @@ export class WhatsAppWebhookController {
     return { ok: true };
   }
 
-  private extractReceiptMedia(msg: {
-    type: string;
-    image?: { id: string; mime_type?: string; url?: string };
-    document?: { id: string; mime_type?: string; url?: string };
-  }): { id: string; url?: string; mimeType: string } | null {
+  private normalizeE164(waId: string): string {
+    return waId.startsWith('+') ? waId : `+${waId}`;
+  }
+
+  private async handleCoexistenceEchoes(
+    phoneNumberId: string,
+    value: WebhookChangeValue | undefined,
+  ): Promise<void> {
+    if (!this.redis) return;
+
+    const echoes = value?.message_echoes ?? value?.messages ?? [];
+    if (echoes.length === 0) return;
+
+    const channel = await this.prisma.channel.findUnique({
+      where: { phoneNumberId },
+      select: { sellerId: true, isActive: true, type: true },
+    });
+    if (!channel?.isActive || channel.type !== ChannelType.WHATSAPP_COEXISTENCE) {
+      return;
+    }
+
+    for (const echo of echoes) {
+      const rawCustomer = echo.to ?? echo.recipient_id ?? value?.contacts?.[0]?.wa_id;
+      if (!rawCustomer) continue;
+      const customerPhone = this.normalizeE164(rawCustomer);
+      await this.redis.set(
+        `coexistence:echo:${channel.sellerId}:${customerPhone}`,
+        '1',
+        'EX',
+        900,
+      );
+    }
+  }
+
+  private extractReceiptMedia(msg: WebhookMessage): {
+    id: string;
+    url?: string;
+    mimeType: string;
+    caption?: string;
+  } | null {
     if (msg.type === 'image' && msg.image?.id) {
       return {
         id: msg.image.id,
         url: msg.image.url,
         mimeType: msg.image.mime_type ?? 'image/jpeg',
+        caption: msg.image.caption,
       };
     }
 
@@ -172,18 +240,20 @@ export class WhatsAppWebhookController {
         id: msg.document.id,
         url: msg.document.url,
         mimeType: msg.document.mime_type,
+        caption: msg.document.caption,
       };
     }
 
     return null;
   }
 
-  private async handleOwnerAction(msg: {
-    from: string;
-    type: string;
-    button?: { payload?: string };
-    interactive?: { button_reply?: { id?: string } };
-  }): Promise<void> {
+  private async handleAlertNumberMessage(msg: WebhookMessage): Promise<void> {
+    const senderPhone = this.normalizeE164(msg.from);
+
+    if (this.redis) {
+      await this.redis.set(`alert:owner-window:${senderPhone}`, '1', 'EX', 84_600);
+    }
+
     const actionPayload =
       msg.type === 'button'
         ? msg.button?.payload
@@ -191,56 +261,81 @@ export class WhatsAppWebhookController {
           ? msg.interactive?.button_reply?.id
           : undefined;
 
-    if (!actionPayload) return;
+    if (actionPayload) {
+      const match = actionPayload.match(/^(CONFIRM|REJECT):([a-z0-9]+)$/i);
+      if (!match) return;
 
-    const match = actionPayload.match(/^(CONFIRM|REJECT):([a-z0-9]+)$/i);
-    if (!match) return;
-
-    const [, verb, proofId] = match;
-    const senderPhone = msg.from.startsWith('+') ? msg.from : `+${msg.from}`;
-
-    // Verify sender is the seller's owner or an active team member for that proof
-    const proof = await this.prisma.proof.findUnique({
-      where: { id: proofId },
-      include: {
-        seller: {
-          select: {
-            id: true,
-            ownerPhone: true,
-            members: { where: { phone: senderPhone, isActive: true }, select: { id: true, role: true } },
-          },
-        },
-      },
-    });
-    if (!proof) return;
-
-    const isOwner = proof.seller.ownerPhone === senderPhone;
-    const member = proof.seller.members[0];
-    if (!isOwner && !member) {
-      this.logger.warn(`Unauthorized WhatsApp action attempt from ${senderPhone} on proof=${proofId}`);
+      const [, verb, proofId] = match;
+      await this.matchingQueue.add(
+        'owner-action',
+        { proofId, verb: verb.toUpperCase(), senderPhone },
+        { removeOnComplete: { age: 86_400 } },
+      );
       return;
     }
 
-    const actorRole = isOwner ? DecisionActor.OWNER : (member.role as DecisionActor);
-    const actorId = member?.id ?? proof.seller.id;
+    const media = this.extractReceiptMedia(msg);
+    if (!media) return;
 
-    if (verb.toUpperCase() === 'CONFIRM') {
-      await this.manualOverride.confirmProof({
-        sellerId: proof.sellerId,
-        proofId: proof.id,
-        actorRole,
-        actorId,
-        note: 'Confirmed via WhatsApp alert button',
-      });
-    } else {
-      await this.manualOverride.rejectProof({
-        sellerId: proof.sellerId,
-        proofId: proof.id,
-        actorRole,
-        actorId,
-        isFraud: true,
-        note: 'Rejected via WhatsApp alert button',
-      });
+    const forwardSellers = await this.prisma.seller.findMany({
+      where: {
+        channels: { some: { type: ChannelType.WHATSAPP_FORWARD, isActive: true } },
+        OR: [
+          { ownerPhone: senderPhone },
+          { members: { some: { phone: senderPhone, isActive: true } } },
+        ],
+      },
+      select: {
+        id: true,
+        channels: {
+          where: { type: ChannelType.WHATSAPP_FORWARD, isActive: true },
+          select: { id: true },
+          take: 1,
+        },
+      },
+    });
+
+    if (forwardSellers.length === 0) {
+      this.logger.debug(`Ignored alert-number media from unregistered sender ${senderPhone}`);
+      return;
     }
+
+    if (forwardSellers.length > 1) {
+      await this.repliesQueue.add('forwarder-ambiguous-seller', {
+        senderPhone,
+        sellerCount: forwardSellers.length,
+      });
+      return;
+    }
+
+    const target = forwardSellers[0];
+    const channelId = target.channels[0]?.id;
+    if (!channelId) return;
+
+    const captionMatch = (media.caption ?? '').match(EGYPT_CAPTION_PHONE_RE);
+    const customerPhone = captionMatch ? `+20${captionMatch[1]}` : null;
+    const receivedAt = new Date(Number(msg.timestamp) * 1000).toISOString();
+
+    await this.proofQueue.add(
+      'ingest-whatsapp-media',
+      {
+        sellerId: target.id,
+        channelId,
+        customerPhone,
+        channelMessageId: msg.id,
+        mediaId: media.id,
+        directUrl: media.url,
+        mimeType: media.mimeType,
+        isForwardedByOwner: true,
+        replyToPhone: senderPhone,
+        receivedAt,
+      },
+      {
+        jobId: `wamid:${msg.id}`,
+        attempts: 4,
+        backoff: { type: 'exponential', delay: 2000 },
+        removeOnComplete: { age: 86_400 },
+      },
+    );
   }
 }

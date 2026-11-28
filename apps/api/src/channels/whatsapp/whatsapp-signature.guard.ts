@@ -10,7 +10,9 @@ import type { Request } from 'express';
 
 @Injectable()
 export class WhatsAppSignatureGuard implements CanActivate {
-  private readonly appSecret = process.env.META_APP_SECRET ?? '';
+  private get appSecret(): string {
+    return process.env.META_APP_SECRET ?? '';
+  }
 
   canActivate(ctx: ExecutionContext): boolean {
     const req = ctx.switchToHttp().getRequest<RawBodyRequest<Request>>();
