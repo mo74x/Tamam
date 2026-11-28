@@ -4,6 +4,11 @@ import { CibParser, InstaPayParser, NbeParser, VodafoneCashParser } from './egyp
 import { LlmEvidenceFallbackService } from './llm-fallback.service.js';
 import { EvidenceParser, ParsedEvidence } from './parser.interface.js';
 
+export interface ParserRegistryOptions {
+  allowUnscopedFallback?: boolean;
+  sellerId?: string;
+}
+
 @Injectable()
 export class ParserRegistryService {
   private readonly parsers: EvidenceParser[] = [
@@ -19,6 +24,7 @@ export class ParserRegistryService {
     senderApp: string | null,
     rawText: string,
     receivedAt: Date,
+    options?: ParserRegistryOptions,
   ): Promise<ParsedEvidence | null> {
     const normalized = toAsciiDigits(rawText).replace(/\s+/g, ' ').trim();
 
@@ -28,12 +34,17 @@ export class ParserRegistryService {
       if (result) return result;
     }
 
-    // Secondary pass: try all regex parsers regardless of senderApp (handles manual paste)
-    for (const parser of this.parsers) {
-      const result = parser.parse(normalized, receivedAt);
-      if (result) return result;
+    // Secondary Pass-2 unscoped regex scan runs ONLY when explicitly allowed (MANUAL_PASTE)
+    if (options?.allowUnscopedFallback) {
+      for (const parser of this.parsers) {
+        const result = parser.parse(normalized, receivedAt);
+        if (result) return result;
+      }
     }
 
-    return this.llmFallback.parse(normalized, receivedAt);
+    return this.llmFallback.parse(normalized, receivedAt, {
+      sellerId: options?.sellerId,
+      senderApp,
+    });
   }
 }

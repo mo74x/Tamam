@@ -1,8 +1,9 @@
 import { InjectQueue } from '@nestjs/bullmq';
 import { Injectable } from '@nestjs/common';
-import { EvidenceSource } from '../generated/prisma/client.js';
 import { Queue } from 'bullmq';
 import { createHash } from 'crypto';
+import { toAsciiDigits } from '../common/normalize.js';
+import { EvidenceSource } from '../generated/prisma/client.js';
 import { classifyNoise } from './utils/otp-filter.js';
 
 export interface EnqueueEvidenceInput {
@@ -11,6 +12,8 @@ export interface EnqueueEvidenceInput {
   senderApp: string | null;
   rawText: string;
   receivedAt: Date;
+  idempotencyKey?: string;
+  deviceId?: string | null;
 }
 
 @Injectable()
@@ -25,20 +28,34 @@ export class EvidenceService {
       return { accepted: false, reason: noise };
     }
 
-    const twoMinBucket = Math.floor(input.receivedAt.getTime() / 120_000);
-    const dedupeHash = createHash('sha256')
-      .update(`${input.sellerId}|${input.rawText.trim()}|${twoMinBucket}`)
-      .digest('hex');
+    const normalizedText = toAsciiDigits(input.rawText).replace(/\s+/g, ' ').trim();
+    let dedupeHash: string;
+
+    if (input.idempotencyKey) {
+      const textHash = createHash('sha256').update(normalizedText).digest('hex');
+      dedupeHash = createHash('sha256')
+        .update(`${input.sellerId}:${input.idempotencyKey}:${textHash}`)
+        .digest('hex');
+    } else {
+      const twoMinBucket = Math.floor(input.receivedAt.getTime() / 120_000);
+      dedupeHash = createHash('sha256')
+        .update(`${input.sellerId}|${normalizedText}|${twoMinBucket}`)
+        .digest('hex');
+    }
 
     await this.evidenceQueue.add(
       'parse-and-store',
       {
-        ...input,
+        sellerId: input.sellerId,
+        source: input.source,
+        senderApp: input.senderApp,
+        rawText: input.rawText,
         receivedAt: input.receivedAt.toISOString(),
         dedupeHash,
+        deviceId: input.deviceId ?? null,
       },
       {
-        jobId: dedupeHash, // BullMQ drops duplicate retries automatically
+        jobId: dedupeHash,
         attempts: 3,
         backoff: { type: 'exponential', delay: 2000 },
         removeOnComplete: 500,

@@ -1,4 +1,12 @@
-import { BadRequestException, Body, Controller, Param, Post, UseGuards } from '@nestjs/common';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  NotFoundException,
+  Param,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
 import { z } from 'zod';
 import { SellerTokenGuard } from '../evidence/guards/seller-token.guard.js';
 import { PrismaService } from '../prisma/prisma.service.js';
@@ -22,18 +30,28 @@ export class DevicesController {
     const { deviceId, deviceLabel, appVersion } = parsed.data;
     const now = new Date();
 
-    const device = deviceId
-      ? await this.prisma.device.update({
-          where: { id: deviceId, sellerId },
-          data: { lastHeartbeatAt: now, appVersion, offlineAlerted: false },
-        })
-      : await this.prisma.device.create({
-          data: { sellerId, deviceLabel, appVersion, lastHeartbeatAt: now },
-        });
+    let resolvedId: string;
+    if (deviceId) {
+      const updated = await this.prisma.device.updateMany({
+        where: { id: deviceId, sellerId },
+        data: { lastHeartbeatAt: now, appVersion, offlineAlerted: false },
+      });
+      if (updated.count === 0) {
+        throw new NotFoundException('Device not found for seller');
+      }
+      resolvedId = deviceId;
+    } else {
+      const device = await this.prisma.device.upsert({
+        where: { sellerId_deviceLabel: { sellerId, deviceLabel } },
+        update: { appVersion, lastHeartbeatAt: now, offlineAlerted: false },
+        create: { sellerId, deviceLabel, appVersion, lastHeartbeatAt: now },
+      });
+      resolvedId = device.id;
+    }
 
     return {
       ok: true,
-      deviceId: device.id,
+      deviceId: resolvedId,
       serverTime: now.toISOString(),
       nextHeartbeatSec: 900, // 15 minutes
     };
